@@ -23,10 +23,10 @@ tts = TTSGenerator(
 product_description = """1.产品名称 荷馨防脱育发洗发水 2.核心卖点 ：防脱，温和，滋养头皮 3.价格对比（直播间价 vs 官方价，比如：249 vs 旗舰店299） 4.规格/数量（比如：两瓶洗发水350ml） 5.限时福利（比如：需要领取优惠券才能优惠：优惠券补贴好了 主播补贴价、赠品：20只精华液+3只发膜、库存限量） 6.信任保障（售后政策/发货渠道，比如：七天无理由/过敏退 + 官方旗舰店发货） 7.互动指令（让观众怎么做，比如：扣1/点购物车/赶紧下单）优惠券已经补贴好啦 主播补贴价、赠品：、库存限量） 6.信任保障（售后政策/发货渠道，比如：支持试用，不好用可以退，七天无理由/过敏退 + 官方旗舰店发货） 7.互动指令（让观众怎么做，比如：扣1/点购物车/赶紧下单）"""
 
 def handle_new_comment(username, comment):
-    if username!="Makeup. Fairt":
+    if username != "Makeup. Fairt":
         print(f"回调函数获取到的最新评论: {username}: {comment}")
-    # 将新评论任务添加到队列中，优先级为1
-        tts.add_task(st(username,comment), priority=1)
+        # 将新评论任务添加到队列中，优先级为1
+        tts.add_task(st(username, comment), priority=1)
 
 
 def chat():
