@@ -5,7 +5,7 @@ import threading
 import queue
 from collections import deque
 from pydub import AudioSegment
-from pydub.playback import play
+from pydub.playback import play, _play_with_simpleaudio
 from gradio_client import Client, handle_file
 from concurrent.futures import ThreadPoolExecutor
 
@@ -30,6 +30,10 @@ class TTSGenerator:
 
         # 启动播放线程
         threading.Thread(target=self.play_audio_worker, daemon=True).start()
+
+        self.currently_playing = None  # 当前播放的音频对象
+        self.currently_playing_path = None  # 当前播放的音频路径
+        self.stop_event = threading.Event()  # 用于停止播放的事件
 
     def generate_audio(self, text, priority):
         def task():
@@ -74,12 +78,24 @@ class TTSGenerator:
         self.executor.submit(task)
 
     def play_audio_worker(self):
-        while True:
-            priority, audio_path, text = self.audio_queue.get()
+        while not self.stop_event.is_set():
+            try:
+                priority, audio_path, text = self.audio_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
             with self.play_lock:
                 try:
+                    if self.currently_playing:
+                        self.currently_playing.stop()  # 停止当前播放
+                        if self.currently_playing_path and os.path.exists(self.currently_playing_path):
+                            os.remove(self.currently_playing_path)  # 删除当前播放的音频文件
+                        self.currently_playing = None
+                        self.currently_playing_path = None
+
                     audio = AudioSegment.from_file(audio_path)
-                    play(audio)
+                    self.currently_playing = _play_with_simpleaudio(audio)  # 播放新音频
+                    self.currently_playing_path = audio_path
                     self.played_queue.append(audio_path)
 
                     print(f"🔊 播放完成: {text}")
@@ -93,6 +109,8 @@ class TTSGenerator:
                     print(f"❌ 音频播放失败: {e}")
                 finally:
                     self.audio_queue.task_done()
+                    self.currently_playing = None  # 重置当前播放对象
+                    self.currently_playing_path = None  # 重置当前播放路径
 
     def add_task(self, text, priority=2):
         self.generate_audio(text, priority)
@@ -104,4 +122,5 @@ class TTSGenerator:
         self.audio_queue.join()
 
     def shutdown(self):
+        self.stop_event.set()
         self.executor.shutdown(wait=True)
