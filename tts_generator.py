@@ -18,11 +18,10 @@ class TTSGenerator:
         self.number = 0
         self.seq = 0  # 新增全局序号
 
-        # 移除原来的播放队列，创建两个优先级队列
+        # 音频任务队列和播放记录
         self.audio_queue = queue.PriorityQueue()
         self.played_queue = []  # 改为列表，保存所有播放过的音频
-        self.priority_queue_1 = queue.Queue()  # 优先级1队列
-        self.priority_queue_2 = queue.Queue()  # 优先级2队列
+        self.play_queue = queue.PriorityQueue()  # (priority, seq, audio_path)
         self.played_audio_paths = set()  # 记录已播放的音频路径
 
         # 锁机制确保音频播放同步
@@ -88,9 +87,9 @@ class TTSGenerator:
                         os.remove(output_audio_path)
                         print(f"✅ 语音合成完成: {new_audio_path}")
                         print(f"这是优先级{priority}的音频文件")
-                        # 提交任务到优先级2队列
+                        # 提交任务到全局队列 (2代表低优先级)
                         self.seq += 1
-                        self.priority_queue_2.put(new_audio_path)
+                        self.play_queue.put((2, self.seq, new_audio_path))
                     except Exception as e:
                         print(f"❌ 语音合成出错: {e}")
             self.executor_low.submit(task)
@@ -131,9 +130,9 @@ class TTSGenerator:
                     print(f"这是优先级{priority}的音频文件")
                     self.seq += 1
                     if priority == 1:
-                        self.priority_queue_1.put(new_audio_path)
+                        self.play_queue.put((1, self.seq, new_audio_path))
                     else:
-                        self.priority_queue_2.put(new_audio_path)
+                        self.play_queue.put((2, self.seq, new_audio_path))
                 except Exception as e:
                     print(f"❌ 语音合成出错: {e}")
             if priority == 1:
@@ -144,16 +143,8 @@ class TTSGenerator:
     def play_audio_worker(self):
         while True:
             try:
-                # 先检查优先级1的队列
-                if not self.priority_queue_1.empty():
-                    audio_path = self.priority_queue_1.get()
-                    self.priority_queue_1.task_done()
-                elif not self.priority_queue_2.empty():
-                    audio_path = self.priority_queue_2.get()
-                    self.priority_queue_2.task_done()
-                else:
-                    time.sleep(1)
-                    continue
+                # 阻塞等待下一个任务
+                priority, seq, audio_path = self.play_queue.get()
                 with self.play_lock:
                     audio = AudioSegment.from_file(audio_path)
                     play(audio)
@@ -167,6 +158,7 @@ class TTSGenerator:
                     if os.path.exists(audio_path):
                         os.remove(audio_path)
                         self.played_audio_paths.remove(audio_path)
+                self.play_queue.task_done()
             except Exception as e:
                 print(f"❌ 音频播放失败: {e}")
 
@@ -174,8 +166,8 @@ class TTSGenerator:
         self.generate_audio(text, priority)
 
     def get_unprocessed_size(self):
-        # 返回两个队列中待处理任务的总数
-        return self.priority_queue_1.qsize() + self.priority_queue_2.qsize()
+        # 返回全局播放队列里的待处理任务数量
+        return self.play_queue.qsize()
 
     def wait_for_completion(self):
         self.audio_queue.join()
@@ -190,5 +182,5 @@ class TTSGenerator:
         self.play_audio_thread.join()
 
     def can_generate_new_script(self):
-        # 判断两个队列中任务总数，小于2时允许生成新话术
-        return (self.priority_queue_1.qsize() + self.priority_queue_2.qsize()) < 2
+        # 修改为判断全局播放队列中的待处理任务数，小于2时允许生成新话术
+        return self.play_queue.qsize() < 2
