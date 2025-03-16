@@ -1,128 +1,68 @@
-import time
-import os
-import shutil
 import threading
-import queue
-from collections import deque
-from pydub import AudioSegment
-from pydub.playback import play
-from gradio_client import Client, handle_file
-from concurrent.futures import ThreadPoolExecutor
+import time
+from liveMan import DouyinLiveWebFetcher
+from tts_generator import TTSGenerator
+from deepseek_client import DeepSeekClient
+from ali import stream_chat_with_voice as st
 
-class TTSGenerator:
-    def __init__(self, client_url,  ref_audio_path, output_dir):
-        self.client = Client(client_url)
-        self.ref_audio_path = ref_audio_path
-        self.output_dir = output_dir
-        os.makedirs(self.output_dir, exist_ok=True)
-        self.number=0
+# 创建 TTSGenerator 实例
+deepseek = DeepSeekClient(
+    api_url="https://api.deepseek.com/v1",
+    api_key="sk-5e0c624b39cc4f5c8377a5a1009be2a3"
+)
 
-        # 音频任务队列和播放记录
-        self.audio_queue = queue.PriorityQueue()
-        self.played_queue = []  # 改为列表，保存所有播放过的音频
-        self.low_priority_queue = deque(maxlen=2)  # 记录优先级低的音频路径
-        self.high_priority_queue = deque(maxlen=2)  # 记录优先级高的音频路径
-        self.played_audio_paths = set()  # 记录已播放的音频路径
+tts = TTSGenerator(
+    client_url="http://localhost:9872/",
+    ref_audio_path=r"C:\Users\徐康文\Desktop\样本声音\十分钟温水冲泡三秒之内喝掉啊，饱腹感达到四到六个小时的啊。.wav",
+    output_dir=r"D:/output_audio"
+)
 
-        # 锁机制确保音频播放同步
-        self.play_lock = threading.Lock()
+# 产品描述（固定）
+with open('product.txt', 'r', encoding='utf-8') as file:
+     product_description = file.read()
 
-        # 线程池管理任务
-        self.executor = ThreadPoolExecutor(max_workers=10)
+def handle_new_comment(username, comment):
+    print(f"回调函数获取到的最新评论: {username}: {comment}")
+    # 将新评论任务添加到队列中，优先级为1
+    tts.add_task(st(username,comment), priority=1)
 
-        # 启动播放线程
-        self.play_audio_thread = threading.Thread(target=self.play_audio_worker, daemon=True)
-        self.play_audio_thread.start()
+def generate_script_task():
+    while True:
+        # 检查当前队列大小，确保不会生成过多的任务
+        if tts.get_unprocessed_size() < 2 and tts.can_generate_new_script():
+            #检查还没有生成语音的文本
+            if tts.get_number_ds()<4:
+            # 生成话术文本并添加到队列中，优先级为2
+                tts.add_task(deepseek.fetch_text(product_description), priority=2)
+        # 等待一段时间后再生成下一个话术文本
+        time.sleep(10)  # 根据需要调整时间间隔
 
-    def generate_audio(self, text, priority):
-        self.number=self.number+1
-        def task():
-            try:
-                result = self.client.predict(
-                    ref_wav_path=handle_file(self.ref_audio_path),
-                    prompt_text="十分钟温水冲泡三秒之内喝掉啊，饱腹感达到四到六个小时的啊",
-                    prompt_language="中文",
-                    text=text,
-                    text_language="中文",
-                    how_to_cut="凑四句一切",
-                    top_k=15,
-                    top_p=1,
-                    temperature=1,
-                    ref_free=False,
-                    speed=0.85,
-                    if_freeze=False,
-                    inp_refs=None,
-                    sample_steps=8,
-                    if_sr=False,
-                    pause_second=0.3,
-                    api_name="/get_tts_wav"
-                )
+if __name__ == '__main__':
+    live_id = '914411562232'
+    room = DouyinLiveWebFetcher(live_id)
 
-                if not result:
-                    print("❌ 语音合成失败: API 未返回有效数据")
-                    return
+    # 设置回调函数
+    room.comment_callback = handle_new_comment
 
-                output_audio_path = result
-                timestamp = int(time.time())
-                new_audio_path = os.path.join(self.output_dir, f"audio_{timestamp}.wav")
+    # 获取直播间状态
+    room.get_room_status()
 
-                # 复制文件确保稳定性
-                shutil.copy2(output_audio_path, new_audio_path)
-                os.remove(output_audio_path)  # 删除临时文件
-                print(f"✅ 语音合成完成: {new_audio_path}")
-                print(f"这是优先级{priority}的音频文件")
+    # 启动任务处理线程
+    threading.Thread(target=tts.play_audio_worker, daemon=True).start()
 
-                if priority == 1:
-                    self.high_priority_queue.append(new_audio_path)
-                else:
-                    self.low_priority_queue.append(new_audio_path)
-            except Exception as e:
-                print(f"❌ 语音合成出错: {e}")
+    # 启动话术生成任务线程
+    script_thread = threading.Thread(target=generate_script_task, daemon=True)
+    script_thread.start()
 
-        self.executor.submit(task)
-
-
-    def play_audio_worker(self):
-        while True:
-            with self.play_lock:
-                try:
-                    if self.high_priority_queue:
-                        audio_path = self.high_priority_queue.popleft()
-                    elif self.low_priority_queue:
-                        audio_path = self.low_priority_queue.popleft()
-                    else:
-                        continue  # 没有音频播放时继续循环
-
-                    audio = AudioSegment.from_file(audio_path)
-                    play(audio)
-                    self.played_audio_paths.add(audio_path)
-                    print(f"还有{self.number}个音频未生成音频")
-                    self.number=self.number-1
-
-                    print(f"🔊 播放完成: {audio_path}")
-
-                    # 删除已播放的音频文件
-                    if os.path.exists(audio_path):
-                        os.remove(audio_path)
-                        self.played_audio_paths.remove(audio_path)
-                except Exception as e:
-                    print(f"❌ 音频播放失败: {e}")
-
-
-    def add_task(self, text, priority=2):
-        self.generate_audio(text, priority)
-
-    def get_unprocessed_size(self):
-        return self.audio_queue.qsize()
-
-    def wait_for_completion(self):
-        self.audio_queue.join()
-    def get_number_ds(self):
-        return self.number
-
-    def shutdown(self):
-        self.executor.shutdown(wait=True)
-        self.play_audio_thread.join()
-
-    def can_generate_new_script(self):
-        return len(self.low_priority_queue) < 2 and len(self.high_priority_queue) < 2
+    # 启动 WebSocket 连接，开始抓取弹幕
+    while True:
+        try:
+            room.start()
+        except KeyboardInterrupt:
+            room.stop()
+            tts.shutdown()
+            script_thread.join()
+            break
+        except Exception as e:
+            print(f"❌ 连接出错: {e}")
+            time.sleep(5)  # 等待一段时间后重试
