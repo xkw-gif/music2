@@ -1,6 +1,7 @@
-# tts_client.py (V10.0 - 完整功能最终版)
+# tts_client.py (V10.2 - 助播逻辑最终修复版)
 # 核心架构：客户端完整复刻 tts_text.py 的所有功能逻辑，包括文本预处理、任务跟踪、
-# 关键词检测、AI助播调用、音频拼接等。仅将语音合成步骤替换为对服务器的网络请求。
+# 关键词检测、AI助播调用、音频拼接等。仅将语音合成替换为对服务器的网络请求。
+# 本次更新：重构了助播触发逻辑，增加了详细的诊断日志，提升了健壮性。
 import collections, random, re, time, os, shutil, threading, queue, json, struct, socket, sys, base64
 import subprocess
 from pydub import AudioSegment
@@ -95,9 +96,8 @@ class TTSClientGenerator:
 
         filtered_text = self._filter_sensitive(text)
         
-        # 长文本分割逻辑
         sentences = []
-        if len(filtered_text) > 100 and priority == 2: # 只有低优先级长文本才分割
+        if len(filtered_text) > 100 and priority == 2:
              sentences = self._split_text(filtered_text)
         else:
              sentences = [filtered_text]
@@ -108,42 +108,56 @@ class TTSClientGenerator:
 
             seq = self._get_next_seq()
             
-            # 更新任务计数器
             if priority < 2: self.pending_priority1 += 1
             else: self.pending_priority2 += 1
 
-            if priority == 1: # 自动任务需要跟踪ID以便取消
+            if priority == 1:
                 self.auto_task_ids.append(seq)
                 if len(self.auto_task_ids) > 5:
                     self.cancelled_auto_tasks.add(self.auto_task_ids.popleft())
 
-            # 初始化重组缓冲区
             self.reassembly_buffer[seq] = {"main": None, "assist": None, "content": clean_sentence, "priority": priority}
 
-            # 发送主声音请求
             main_payload = {"request_id": seq, "text": clean_sentence, "is_assistant": False}
             threading.Thread(target=self._send_request, args=(main_payload,)).start()
 
-            # 关键词检测与助播逻辑
-            triggered_keyword = next((kw for kw in self.keyword_responses if kw in clean_sentence), None)
-            if triggered_keyword and self.ai_generator:
-                self.log(f"🎤 检测到关键词 '{triggered_keyword}'，正在调用AI助播...")
-                assistant_prompt = f"主播刚刚说了：『{clean_sentence}』。请你作为搭档，围绕关键词 '{triggered_keyword}'，说一句简短捧哏的话。"
-                try:
-                    assist_text = self.ai_generator.get_response("主播", assistant_prompt, [], is_assistant_task=True)
-                    if assist_text:
-                        self.log(f"🤖 AI助播生成内容: {assist_text}")
-                        assist_payload = {"request_id": seq, "text": assist_text, "is_assistant": True}
-                        threading.Thread(target=self._send_request, args=(assist_payload,)).start()
-                    else:
-                        # 如果AI没返回内容，也要标记助播部分已“完成”
-                        self.reassembly_buffer[seq]['assist'] = "done"
-                except Exception as e:
-                    self.log(f"❌ 调用AI助播时出错: {e}")
-                    self.reassembly_buffer[seq]['assist'] = "done"
-            else:
-                # 如果没有关键词，直接标记助播部分已“完成”
-                self.reassembly_buffer[seq]['assist'] = "done"
+            # 【核心改动】调用独立的助播触发函数
+            self._trigger_assistant_if_needed(clean_sentence, seq)
+
+    def _trigger_assistant_if_needed(self, text, seq):
+        """【新增】独立的助播触发函数，包含详细诊断日志"""
+        # 1. 检查关键词
+        triggered_keyword = next((kw for kw in self.keyword_responses if kw in text), None)
+        if not triggered_keyword:
+            self.log(f"【助播诊断】任务 {seq}: 未在'{text[:20]}...'中检测到关键词。流程终止。")
+            if seq in self.reassembly_buffer: self.reassembly_buffer[seq]['assist'] = "done"
+            return
+
+        # 2. 检查AI模块
+        if not self.ai_generator:
+            self.log(f"【助播诊断】任务 {seq}: 检测到关键词 '{triggered_keyword}'，但AI模块不可用。流程终止。")
+            if seq in self.reassembly_buffer: self.reassembly_buffer[seq]['assist'] = "done"
+            return
+            
+        # 3. 如果条件都满足，则在后台线程中启动AI和语音生成
+        self.log(f"【助播诊断】🎤 任务 {seq}: 条件满足 (关键词: '{triggered_keyword}')，启动AI助播任务。")
+        
+        def get_assist_voice_task():
+            assistant_prompt = f"主播刚刚说了：『{text}』。请你作为搭档，围绕关键词 '{triggered_keyword}'，说一句简短捧哏的话。"
+            try:
+                assist_text = self.ai_generator.get_response("主播", assistant_prompt, [], is_assistant_task=True)
+                if assist_text and assist_text.strip():
+                    self.log(f"【助播诊断】🤖 AI为任务 {seq} 生成内容: {assist_text}")
+                    assist_payload = {"request_id": seq, "text": assist_text, "is_assistant": True}
+                    self._send_request(assist_payload)
+                else:
+                    self.log(f"【助播诊断】⚠️ AI助播返回内容为空，任务 {seq} 将不触发助播。")
+                    if seq in self.reassembly_buffer: self.reassembly_buffer[seq]['assist'] = "done"
+            except Exception as e:
+                self.log(f"【助播诊断】❌ 调用AI助播时出错 (任务 {seq}): {e}")
+                if seq in self.reassembly_buffer: self.reassembly_buffer[seq]['assist'] = "done"
+        
+        threading.Thread(target=get_assist_voice_task).start()
 
     def network_listener_worker(self):
         """持续监听并接收服务器返回的音频块"""
@@ -160,15 +174,13 @@ class TTSClientGenerator:
 
                 if packet.get("status") == "error":
                     self.log(f"收到服务器错误包: ReqID {req_id}")
-                    # 标记对应的部分为失败
                     part = 'assist' if packet.get('is_assistant') else 'main'
-                    self.reassembly_buffer[req_id][part] = "error"
+                    if req_id in self.reassembly_buffer: self.reassembly_buffer[req_id][part] = "error"
                 else:
                     audio_data = base64.b64decode(packet['audio_data'])
                     part = 'assist' if packet.get('is_assistant') else 'main'
-                    self.reassembly_buffer[req_id][part] = audio_data
+                    if req_id in self.reassembly_buffer: self.reassembly_buffer[req_id][part] = audio_data
                 
-                # 检查这个任务的所有部分是否都已返回
                 self._check_and_assemble(req_id)
 
             except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
@@ -180,24 +192,24 @@ class TTSClientGenerator:
         """检查任务的所有部分是否都已收到，如果是，则拼接并入队"""
         buffer_entry = self.reassembly_buffer.get(seq)
         if buffer_entry and buffer_entry['main'] is not None and buffer_entry['assist'] is not None:
-            # 所有部分都已收到（成功、失败或标记完成）
             buffer_entry = self.reassembly_buffer.pop(seq)
             
             main_data = buffer_entry['main']
             assist_data = buffer_entry['assist']
             
-            if main_data == "error": # 如果主声音失败，则整个任务失败
+            if main_data == "error":
                 self.log(f"任务 {seq} 因主声音生成失败而被丢弃。")
+                # 即使失败也要更新计数器
+                if buffer_entry['priority'] < 2: self.pending_priority1 = max(0, self.pending_priority1 - 1)
+                else: self.pending_priority2 = max(0, self.pending_priority2 - 1)
                 return
 
             try:
-                # 保存主声音
                 main_audio_path = os.path.join(self.output_dir, f"main_{seq}.wav")
                 with open(main_audio_path, 'wb') as f: f.write(main_data)
                 
                 final_audio_path = main_audio_path
                 
-                # 如果有助播声音，则拼接
                 if isinstance(assist_data, bytes):
                     assist_audio_path = os.path.join(self.output_dir, f"assist_{seq}.wav")
                     with open(assist_audio_path, 'wb') as f: f.write(assist_data)
@@ -217,6 +229,9 @@ class TTSClientGenerator:
 
             except Exception as e:
                 self.log(f"❌ 拼接或保存任务 {seq} 音频时失败: {e}")
+                # 即使失败也要更新计数器
+                if buffer_entry['priority'] < 2: self.pending_priority1 = max(0, self.pending_priority1 - 1)
+                else: self.pending_priority2 = max(0, self.pending_priority2 - 1)
 
     def play_audio_worker(self):
         """【核心恢复】完整复刻 tts_text.py 的播放逻辑"""
@@ -265,7 +280,6 @@ class TTSClientGenerator:
         else:
             self.log(f"❌ 本地音效文件未找到: {audio_path}")
 
-    # ... 其他辅助函数 ...
     def interrupt_and_speak(self, text):
         self.log(f"⚡ 收到紧急插话指令: {text}")
         self.add_task(text, priority=0)
@@ -276,8 +290,7 @@ class TTSClientGenerator:
     def test_and_play_sync(self, text, use_assistant=False):
         self.log(f"【声音测试】{'助播' if use_assistant else '主线'}: {text}")
         if not text: return
-        request_type = 'test_assistant' if use_assistant else 'test_main'
-        self.add_task(text, priority=-1, request_type=request_type)
+        self.add_task(text, priority=-1, request_type='test_assistant' if use_assistant else 'test_main')
     def stop(self):
         self._stop_event.set()
         if self.current_playback_process and self.current_playback_process.poll() is None:
