@@ -1,210 +1,204 @@
-# tts_server.py (V5.0 - 流式处理版)
-# 核心架构变更：服务器不再拼接音频，而是将长文本分割后，异步生成音频块，并立即流式返回给客户端。
-import socket
-import threading
-import json
-import logging
-import os
-import struct
-import time
-import random
-import re
-import requests
-import base64 # 用于音频数据的编码
-from gradio_client import Client, handle_file
-from concurrent.futures import ThreadPoolExecutor # 引入线程池
+# tts_client.py (V5.0 - 流式处理版)
+# 核心架构变更：客户端现在接收音频块数据包，并在本地进行重组和拼接，再放入播放队列。
+import collections, random, re, time, os, shutil, threading, queue, json, struct, socket, sys, base64
+import subprocess
+from pydub import AudioSegment
 
-# --- 服务器端配置 ---
-GRADIO_URL = "http://localhost:9872/"
-REF_AUDIO_PATH = "领红包左上角抢红包啦，领完红包，抢完红包，再去拍，再去卖，再去拍啊，正品保证正品保真啦。.wav"
-# ... 其他配置保持不变 ...
-ASSISTANT_TTS_URL = "http://localhost:9880/"
-ASSISTANT_SPEAKER = "助播2.pt"
-DASHSCOPE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
-SERVER_HOST = '0.0.0.0'
-SERVER_PORT = 12345
-OUTPUT_DIR = "server_temp_audio"
-LONG_TEXT_THRESHOLD = 100
+class TTSClientGenerator:
+    def __init__(self, server_host, server_port, output_dir, **kwargs):
+        self.server_host = server_host
+        self.server_port = server_port
+        self.sock = None
+        self.lock = threading.Lock()
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        # 【核心改动】音频块重组缓冲区
+        self.reassembly_buffer = {} #格式: {req_id: {"chunks": {}, "total": N, "received_time": T}}
+        self.play_queue = queue.PriorityQueue()
+        self._stop_event = threading.Event()
+        self.current_playback_process = None
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
+        self.log(f"流式TTS客户端初始化，准备连接服务器 {self.server_host}:{self.server_port}")
+        self._connect_to_server()
 
-class StreamingTTSServer:
-    def __init__(self):
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        self.main_tts_client = None
-        self.request_id_counter = 0
-        self.request_lock = threading.Lock()
+        # 启动独立的网络监听和播放线程
+        self.network_thread = threading.Thread(target=self.network_listener_worker, daemon=True)
+        self.play_audio_thread = threading.Thread(target=self.play_audio_worker, daemon=True)
+        self.network_thread.start()
+        self.play_audio_thread.start()
 
-        # 【核心改动】引入高、低优先级两个线程池
-        self.executor_high = ThreadPoolExecutor(max_workers=5, thread_name_prefix='HighPrio')
-        self.executor_low = ThreadPoolExecutor(max_workers=5, thread_name_prefix='LowPrio')
+    def log(self, message):
+        print(f"[TTSClient] {message}")
 
-        try:
-            self.main_tts_client = Client(GRADIO_URL)
-            logging.info("✅ 主TTS服务连接成功。")
-        except Exception as e:
-            logging.error(f"❌ 无法连接主TTS服务: {e}")
-
-    def get_next_request_id(self):
-        with self.request_lock:
-            self.request_id_counter += 1
-            return self.request_id_counter
-
-    def _split_sentences(self, text):
-        # ... 分割逻辑不变 ...
-        sentences = [s.strip() for s in re.split(r'([？！。.~…\n，,])', text) if s.strip()]
-        merged = []
-        temp = ""
-        for item in sentences:
-            if item in '？！。.~…\n，,':
-                temp += item
-                merged.append(temp)
-                temp = ""
-            else:
-                temp += item
-        if temp: merged.append(temp)
-        return merged
-
-    def _generate_and_send_chunk(self, client_socket, text_chunk, priority, request_id, chunk_id, total_chunks, is_assistant=False):
-        """生成单个音频块并立即发送的核心函数"""
-        try:
-            audio_path = self.generate_assistant_audio(text_chunk) if is_assistant else self.generate_main_audio(text_chunk)
-            
-            if audio_path and os.path.exists(audio_path):
-                with open(audio_path, 'rb') as f:
-                    audio_data = f.read()
-                
-                # 使用Base64编码音频数据，确保JSON传输安全
-                encoded_audio = base64.b64encode(audio_data).decode('utf-8')
-                
-                response_packet = {
-                    "status": "success",
-                    "request_id": request_id,
-                    "chunk_id": chunk_id,
-                    "total_chunks": total_chunks,
-                    "priority": priority,
-                    "text": text_chunk,
-                    "audio_data": encoded_audio
+    def add_task(self, text, priority=2):
+        """主程序调用的唯一入口：发送任务请求到服务器"""
+        with self.lock:
+            if not self.sock:
+                if not self._connect_to_server():
+                    self.log(f"任务发送失败，无法连接服务器: '{text[:30]}...'")
+                    return
+            try:
+                request_packet = {
+                    "text": text,
+                    "priority": priority
                 }
-                self._send_msg(client_socket, json.dumps(response_packet).encode('utf-8'))
-                logging.info(f"✅ 已发送音频块 {chunk_id}/{total_chunks} (ReqID: {request_id})")
-                os.remove(audio_path)
-            else:
-                raise ValueError("音频文件生成失败或未找到")
-        except Exception as e:
-            logging.error(f"处理音频块 {chunk_id}/{total_chunks} (ReqID: {request_id}) 失败: {e}")
-            # 发送一个失败的包，让客户端知道
-            error_packet = {"status": "error", "request_id": request_id, "chunk_id": chunk_id, "message": str(e)}
-            self._send_msg(client_socket, json.dumps(error_packet).encode('utf-8'))
+                self._send_msg(json.dumps(request_packet).encode('utf-8'))
+                self.log(f"已发送任务 (Prio:{priority}): '{text[:30]}...'")
+            except Exception as e:
+                self.log(f"发送任务时出错: {e}")
+                self.sock = None
 
-    def handle_client(self, client_socket, addr):
-        logging.info(f"接受来自 {addr} 的新连接。")
-        try:
-            while True:
-                data = self._recv_msg(client_socket)
-                if data is None: break
-
-                message = json.loads(data.decode('utf-8'))
-                text = message.get('text')
-                priority = message.get('priority', 2) # 从客户端接收优先级
-
-                request_id = self.get_next_request_id()
-                logging.info(f"收到新任务 ReqID:{request_id}, Prio:{priority}, Text:'{text[:30]}...'")
-
-                # 1. 分割文本
-                text_chunks = self._split_sentences(text)
-                if not text_chunks: continue
-                total_chunks = len(text_chunks)
-
-                # 2. 选择执行器并提交任务
-                executor = self.executor_high if priority < 2 else self.executor_low
+    def network_listener_worker(self):
+        """专门负责接收和处理服务器发来的所有数据块"""
+        while not self._stop_event.is_set():
+            if not self.sock:
+                time.sleep(2) # 如果未连接，稍等后重试
+                continue
+            try:
+                raw_data = self._recv_msg()
+                if raw_data is None:
+                    self.log("与服务器连接断开，将尝试重连...")
+                    self.sock = None
+                    continue
                 
-                for i, chunk in enumerate(text_chunks):
-                    chunk_id = i + 1
-                    executor.submit(
-                        self._generate_and_send_chunk,
-                        client_socket,
-                        chunk,
-                        priority,
-                        request_id,
-                        chunk_id,
-                        total_chunks,
-                        is_assistant=False # 简化：此示例中所有请求都为主播声音
-                    )
-        except (ConnectionResetError, json.JSONDecodeError):
-            logging.warning(f"客户端 {addr} 连接异常或断开。")
-        finally:
-            client_socket.close()
+                packet = json.loads(raw_data.decode('utf-8'))
+                
+                if packet.get("status") == "error":
+                    self.log(f"收到服务器错误包: ReqID {packet.get('request_id')}, Chunk {packet.get('chunk_id')}, Msg: {packet.get('message')}")
+                    continue
 
-    # ... generate_main_audio 和 generate_assistant_audio 函数保持不变 ...
-    def generate_main_audio(self, text):
-        if not self.main_tts_client: return None
-        audio_path = None
+                req_id = packet['request_id']
+                
+                # 将数据块存入缓冲区
+                if req_id not in self.reassembly_buffer:
+                    self.reassembly_buffer[req_id] = {
+                        "chunks": {},
+                        "total": packet['total_chunks'],
+                        "received_time": time.time(),
+                        "priority": packet['priority'],
+                        "full_text": "" # 用于拼接完整文本
+                    }
+                
+                # 解码并存储音频块
+                audio_data = base64.b64decode(packet['audio_data'])
+                self.reassembly_buffer[req_id]["chunks"][packet['chunk_id']] = (audio_data, packet['text'])
+                
+                # 检查是否已收齐所有块
+                buffer_entry = self.reassembly_buffer[req_id]
+                if len(buffer_entry["chunks"]) == buffer_entry["total"]:
+                    self.log(f"ReqID {req_id} 的所有 {buffer_entry['total']} 个音频块已收齐，准备拼接。")
+                    self._assemble_and_queue_audio(req_id)
+
+            except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+                self.log("与服务器连接中断，将尝试重连...")
+                self.sock = None
+            except Exception as e:
+                self.log(f"网络监听线程出错: {e}")
+
+    def _assemble_and_queue_audio(self, req_id):
+        """拼接指定ID的音频块并放入播放队列"""
+        buffer_entry = self.reassembly_buffer.pop(req_id)
+        
         try:
-            speed = round(random.uniform(0.9, 1.1), 2)
-            audio_path = self.main_tts_client.predict(
-                ref_wav_path=handle_file(REF_AUDIO_PATH), prompt_text="领红包左上角抢红包啦，领完红包，抢完红包，再去拍，再去卖，再去拍啊，正品保证正品保真啦。", text=text,
-                prompt_language="中文", text_language="中文", how_to_cut="凑四句一切",
-                top_k=15, top_p=1, temperature=1, ref_free=False, speed=speed, api_name="/get_tts_wav"
-            )
-            return audio_path
+            combined_audio = AudioSegment.empty()
+            full_text_parts = []
+            # 按chunk_id排序并拼接
+            sorted_chunks = sorted(buffer_entry["chunks"].items())
+            
+            for chunk_id, (audio_data, text_part) in sorted_chunks:
+                temp_chunk_path = os.path.join(self.output_dir, f"chunk_{req_id}_{chunk_id}.wav")
+                with open(temp_chunk_path, 'wb') as f:
+                    f.write(audio_data)
+                
+                segment = AudioSegment.from_file(temp_chunk_path)
+                combined_audio += segment
+                full_text_parts.append(text_part)
+                os.remove(temp_chunk_path)
+
+            final_path = os.path.join(self.output_dir, f"final_audio_{req_id}.wav")
+            combined_audio.export(final_path, format="wav")
+            
+            full_text = "".join(full_text_parts)
+            self.play_queue.put((buffer_entry["priority"], req_id, final_path, full_text))
+            self.log(f"✅ ReqID {req_id} 音频拼接完成并放入播放队列。")
+
         except Exception as e:
-            logging.error(f"主TTS生成失败: {e}")
-            if audio_path and os.path.exists(audio_path): os.remove(audio_path)
-            return None
+            self.log(f"❌ 拼接 ReqID {req_id} 音频时失败: {e}")
 
-    def generate_assistant_audio(self, text):
-        params = {"text": text, "speaker": ASSISTANT_SPEAKER, "volume": 1.3, "speed": 1.1}
-        temp_path = os.path.join(OUTPUT_DIR, f"assist_{int(time.time())}.wav")
+    def play_audio_worker(self):
+        """播放队列中的完整音频，此逻辑基本不变"""
+        while not self._stop_event.is_set():
+            try:
+                priority, req_id, audio_path, content = self.play_queue.get(timeout=1)
+                
+                self.log(f"正在播放任务 ReqID:{req_id} (Prio:{priority}): '{content[:50]}...'")
+                self._play_audio_in_subprocess(audio_path)
+
+                if os.path.exists(audio_path):
+                    try: os.remove(audio_path)
+                    except OSError: pass
+
+                self.play_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                self.log(f"❌ 音频播放工作线程出错: {e}")
+
+    # ... 其他辅助函数 ...
+    def stop(self):
+        self._stop_event.set()
+        if self.current_playback_process and self.current_playback_process.poll() is None:
+            self.current_playback_process.terminate()
+        with self.lock:
+            if self.sock:
+                self.sock.close()
+                self.sock = None
+
+    def _play_audio_in_subprocess(self, audio_path):
+        # ... 此函数逻辑不变 ...
+        if self.current_playback_process and self.current_playback_process.poll() is None:
+            self.current_playback_process.terminate()
+            try: self.current_playback_process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired: pass
         try:
-            url_to_request = ASSISTANT_TTS_URL.strip('/')
-            response = requests.get(url_to_request, params=params, stream=True, timeout=10)
-            response.raise_for_status()
-            with open(temp_path, 'wb') as f: f.write(response.content)
-            return temp_path
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            player_script_path = os.path.join(base_dir, "local_model_client.py")
+            if not os.path.exists(player_script_path):
+                self.log(f"❌ 致命错误：找不到播放脚本 'local_model_client.py'")
+                return
+            command = [sys.executable, player_script_path, os.path.abspath(audio_path)]
+            self.current_playback_process = subprocess.Popen(command, cwd=base_dir, creationflags=subprocess.CREATE_NO_WINDOW)
+            self.current_playback_process.wait()
         except Exception as e:
-            logging.error(f"助播TTS生成失败：{e}")
-            if os.path.exists(temp_path): os.remove(temp_path)
-            return None
+            self.log(f"❌ 启动播放子进程时出错: {e}")
 
-    # ... start() 和网络辅助函数保持不变 ...
-    def start(self):
-        if not self.main_tts_client:
-            logging.critical("❌ 主TTS服务初始化失败，服务器无法启动。")
-            return
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind((SERVER_HOST, SERVER_PORT))
-        server_socket.listen(5)
-        logging.info(f"🚀 流式服务器已启动，正在监听 {SERVER_HOST}:{SERVER_PORT}...")
-        try:
-            while True:
-                client, addr = server_socket.accept()
-                threading.Thread(target=self.handle_client, args=(client, addr), daemon=True).start()
-        except KeyboardInterrupt:
-            logging.info("服务器正在关闭...")
-        finally:
-            server_socket.close()
+    def _connect_to_server(self):
+        with self.lock:
+            if self.sock: self.sock.close()
+            try:
+                self.log("正在连接到TTS中央服务器...")
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.connect((self.server_host, self.server_port))
+                self.log("✅ 成功连接到TTS服务器。")
+                return True
+            except Exception as e:
+                self.log(f"❌ 连接TTS服务器失败: {e}")
+                self.sock = None
+                return False
 
-    def _send_msg(self, sock, data):
-        try:
-            length = struct.pack('>I', len(data))
-            sock.sendall(length + data)
-        except (ConnectionResetError, BrokenPipeError):
-            logging.warning("尝试向已关闭的客户端发送消息。")
-    def _recv_msg(self, sock):
-        raw_msglen = self._recv_all(sock, 4)
+    def _send_msg(self, data):
+        length = struct.pack('>I', len(data))
+        self.sock.sendall(length + data)
+    def _recv_msg(self):
+        raw_msglen = self._recv_all(4)
         if not raw_msglen: return None
         msglen = struct.unpack('>I', raw_msglen)[0]
-        return self._recv_all(sock, msglen)
-    def _recv_all(self, sock, n):
+        return self._recv_all(msglen)
+    def _recv_all(self, n):
         data = bytearray()
         while len(data) < n:
-            packet = sock.recv(n - len(data))
+            packet = self.sock.recv(n - len(data))
             if not packet: return None
             data.extend(packet)
         return data
-
-if __name__ == "__main__":
-    server = StreamingTTSServer()
-    server.start()
