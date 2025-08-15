@@ -1,8 +1,7 @@
-# tts_client.py (V7.0 - JSON协议与文本同步最终版)
-# 核心架构：客户端接收包含文本和音频的JSON包，实现音文同步。
+# tts_client.py (V8.0 - 客户端分割、无拼接播放最终版)
+# 核心架构：客户端分割文本，向服务器发送块请求。接收到音频块后，不拼接，直接放入播放队列。
 import collections, random, re, time, os, shutil, threading, queue, json, struct, socket, sys, base64
 import subprocess
-from pydub import AudioSegment
 
 class TTSClientGenerator:
     def __init__(self, server_host, server_port, output_dir, now_playing_callback=None, **kwargs):
@@ -18,82 +17,84 @@ class TTSClientGenerator:
                                "[呼吸]": ["呼吸1.WAV", "呼吸2.WAV", "呼吸3.WAV"]}
         
         self.keyword_responses = kwargs.get('keyword_responses', {})
-        self.now_playing_callback = now_playing_callback # 用于更新UI的回调函数
+        self.now_playing_callback = now_playing_callback
         
+        # 播放队列，现在直接存放音频块
         self.play_queue = queue.PriorityQueue()
         self._stop_event = threading.Event()
         self.current_playback_process = None
-        self.seq = 0
+        self.request_id_counter = 0
 
-        self.log(f"TTS客户端初始化，准备连接服务器 {self.server_host}:{self.server_port}")
+        self.log(f"流式TTS客户端初始化，准备连接服务器 {self.server_host}:{self.server_port}")
         self._connect_to_server()
 
+        self.network_thread = threading.Thread(target=self.network_listener_worker, daemon=True)
         self.play_audio_thread = threading.Thread(target=self.play_audio_worker, daemon=True)
+        self.network_thread.start()
         self.play_audio_thread.start()
 
     def log(self, message):
         print(f"[TTSClient] {message}")
 
-    def _send_request_to_server(self, payload):
-        def task():
-            with self.lock:
-                if not self.sock and not self._connect_to_server():
-                    self.log(f"任务发送失败，无法连接服务器。")
-                    return
-                try:
-                    request_data = json.dumps(payload).encode('utf-8')
-                    self._send_msg(request_data)
-                    self.log(f"已发送请求 (类型:{payload['request_type']}): '{payload['text'][:30]}...'")
+    def _get_next_request_id(self):
+        self.request_id_counter += 1
+        return self.request_id_counter
 
-                    # 【核心改动】接收JSON包
-                    response_data = self._recv_msg()
-                    if not response_data:
-                        raise ConnectionError("服务器未返回有效数据。")
-                    
-                    response_payload = json.loads(response_data.decode('utf-8'))
+    def _split_text(self, text):
+        """在客户端分割文本"""
+        sentences = [s.strip() for s in re.split(r'([？！。.~…\n，,])', text) if s.strip()]
+        merged = []
+        temp = ""
+        for item in sentences:
+            if item in '？！。.~…\n，,':
+                temp += item
+                merged.append(temp)
+                temp = ""
+            else:
+                temp += item
+        if temp: merged.append(temp)
+        return merged
 
-                    if 'error' in response_payload:
-                        self.log(f"❌ 服务器处理任务时返回错误: {response_payload['error']}")
-                        return
-                    
-                    # 从JSON包中解析文本和音频
-                    final_text = response_payload['text']
-                    encoded_audio = response_payload['audio_data']
-                    audio_data = base64.b64decode(encoded_audio) # Base64解码
-                    
-                    self.seq += 1
-                    timestamp = int(time.time())
-                    new_audio_path = os.path.join(self.output_dir, f"audio_{timestamp}_{self.seq}.wav")
-                    with open(new_audio_path, 'wb') as f:
-                        f.write(audio_data)
-                    
-                    # 将解析出的文本和音频路径一起放入队列
-                    self.play_queue.put((payload['priority'], self.seq, new_audio_path, final_text))
-                    self.log(f"✅ 已接收并入队音频与文本 (Prio:{payload['priority']})")
+    def _send_chunk_request(self, payload):
+        """发送单个音频块的生成请求"""
+        with self.lock:
+            if not self.sock and not self._connect_to_server():
+                self.log(f"音频块请求发送失败，无法连接服务器。")
+                return
+            try:
+                request_data = json.dumps(payload).encode('utf-8')
+                self._send_msg(request_data)
+            except Exception as e:
+                self.log(f"发送音频块请求时出错: {e}")
+                self.sock = None
 
-                except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError) as e:
-                    self.log(f"❌ 与服务器连接中断: {e}。")
-                    self.sock = None
-                except Exception as e:
-                    self.log(f"❌ 处理网络任务时发生未知错误: {e}")
-                    self.sock = None
-        
-        threading.Thread(target=task, daemon=True).start()
-
-    def add_task(self, text, priority=2):
+    def add_task(self, text, priority=2, request_type='default'):
+        """主入口：分割文本并为每个分块发送请求"""
         if text in self.sounds_library:
             self._queue_local_sound(text, priority)
             return
+
+        request_id = self._get_next_request_id()
+        chunks = self._split_text(text)
+        if not chunks: return
+        total_chunks = len(chunks)
         
-        triggered_keyword = next((kw for kw in self.keyword_responses if kw in text), None)
-        
-        payload = {
-            "text": text,
-            "priority": priority,
-            "request_type": "default",
-            "triggered_keyword": triggered_keyword
-        }
-        self._send_request_to_server(payload)
+        self.log(f"新任务 ReqID:{request_id} (Prio:{priority}) 被分割成 {total_chunks} 块，开始发送请求...")
+
+        for i, chunk_text in enumerate(chunks):
+            chunk_id = i + 1
+            triggered_keyword = next((kw for kw in self.keyword_responses if kw in chunk_text), None)
+            
+            payload = {
+                "request_id": request_id,
+                "chunk_id": chunk_id,
+                "total_chunks": total_chunks,
+                "priority": priority,
+                "text": chunk_text,
+                "request_type": request_type,
+                "triggered_keyword": triggered_keyword
+            }
+            threading.Thread(target=self._send_chunk_request, args=(payload,)).start()
 
     def interrupt_and_speak(self, text):
         self.log(f"⚡ 收到紧急插话指令: {text}")
@@ -103,34 +104,69 @@ class TTSClientGenerator:
         return self.play_queue.qsize()
 
     def can_generate_new_script(self):
-        return self.get_unprocessed_size() < 5
+        return self.get_unprocessed_size() < 10 # 可以适当调大，因为块很小
 
     def test_and_play_sync(self, text, use_assistant=False):
         self.log(f"【声音测试】{'助播' if use_assistant else '主线'}: {text}")
         if not text: return
-        
-        payload = {
-            "text": text,
-            "priority": -1,
-            "request_type": 'test_assistant' if use_assistant else 'test_main'
-        }
-        self._send_request_to_server(payload)
-        self.log("【声音测试】请求已发送到服务器，请等待播放...")
+        request_type = 'test_assistant' if use_assistant else 'test_main'
+        self.add_task(text, priority=-1, request_type=request_type)
+
+    def network_listener_worker(self):
+        """持续监听并接收服务器返回的音频块，直接放入播放队列"""
+        while not self._stop_event.is_set():
+            if not self.sock:
+                time.sleep(1)
+                continue
+            try:
+                response_data = self._recv_msg()
+                if response_data is None:
+                    self.log("与服务器连接断开，将尝试重连...")
+                    self.sock = None
+                    continue
+                
+                packet = json.loads(response_data.decode('utf-8'))
+                
+                if packet.get("status") == "error":
+                    self.log(f"收到服务器错误包: ReqID {packet.get('request_id')}, Chunk {packet.get('chunk_id')}")
+                    continue
+
+                # 解码音频并保存到临时文件
+                audio_data = base64.b64decode(packet['audio_data'])
+                req_id = packet['request_id']
+                chunk_id = packet['chunk_id']
+                
+                temp_audio_path = os.path.join(self.output_dir, f"audio_{req_id}_{chunk_id}.wav")
+                with open(temp_audio_path, 'wb') as f:
+                    f.write(audio_data)
+                
+                # 【核心改动】将单个音频块直接放入播放队列，用 (req_id, chunk_id) 来排序
+                self.play_queue.put((packet['priority'], req_id, chunk_id, temp_audio_path, packet['text']))
+                self.log(f"✅ 已接收并入队音频块 {chunk_id}/{packet['total_chunks']} (ReqID: {req_id})")
+
+            except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+                self.log("与服务器连接中断，将尝试重连...")
+                self.sock = None
+            except Exception as e:
+                self.log(f"网络监听线程出错: {e}")
 
     def play_audio_worker(self):
+        """按顺序播放队列中的音频块"""
         while not self._stop_event.is_set():
             try:
-                priority, seq, audio_path, content = self.play_queue.get(timeout=1)
+                # 队列现在是 (priority, request_id, chunk_id, audio_path, content)
+                priority, req_id, chunk_id, audio_path, content = self.play_queue.get(timeout=1)
                 
-                # 【核心改动】调用回调函数，将文本发送到UI界面
                 if self.now_playing_callback:
                     self.now_playing_callback(content)
                 
-                self.log(f"正在播放任务 Seq:{seq} (Prio:{priority}): '{content[:50]}...'")
+                self.log(f"正在播放块 ReqID:{req_id}-{chunk_id} (Prio:{priority}): '{content}'")
                 self._play_audio_in_subprocess(audio_path)
+                
                 if os.path.exists(audio_path) and not audio_path.startswith(self.sounds_path):
                     try: os.remove(audio_path)
                     except OSError: pass
+                
                 self.play_queue.task_done()
             except queue.Empty:
                 continue
@@ -139,14 +175,15 @@ class TTSClientGenerator:
 
     def _queue_local_sound(self, command, priority):
         if self.now_playing_callback:
-            self.now_playing_callback(command) # 本地音效也更新UI
+            self.now_playing_callback(command)
         sound_info = self.sounds_library.get(command)
         if not sound_info: return
         filename = random.choice(sound_info) if isinstance(sound_info, list) else sound_info
         audio_path = os.path.join(self.sounds_path, filename)
         if os.path.exists(audio_path):
-            self.seq += 1
-            self.play_queue.put((priority, self.seq, audio_path, command))
+            req_id = self._get_next_request_id()
+            # 本地音效只有一个块
+            self.play_queue.put((priority, req_id, 1, audio_path, command))
             self.log(f"✅ 本地音效已入队: {command}")
         else:
             self.log(f"❌ 本地音效文件未找到: {audio_path}")
