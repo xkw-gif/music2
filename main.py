@@ -1,6 +1,7 @@
-# tts_client.py (V9.0 - 最终完整重构版)
+# tts_client.py (V9.1 - 优化分割逻辑)
 # 核心架构：完整复刻原 tts_text.py 的所有功能逻辑，包括任务跟踪、文本预处理、
 # 音频块重组等，仅将本地语音合成替换为对服务器的网络请求。
+# 本次更新：按照您的要求，修改了文本分割逻辑，现在只按整句分割，不再被逗号打断。
 import collections, random, re, time, os, shutil, threading, queue, json, struct, socket, sys, base64
 import subprocess
 from pydub import AudioSegment
@@ -47,18 +48,22 @@ class TTSClientGenerator:
         return self.request_id_counter
 
     def _split_text(self, text):
-        sentences = [s.strip() for s in re.split(r'([？！。.~…\n，,])', text) if s.strip()]
-        merged = []
-        temp = ""
+        # 【核心改动】修改正则表达式，不再按逗号分割，只按结束标点和换行符分割
+        sentences = [s.strip() for s in re.split(r'([？！。.~…\n])', text) if s.strip()]
+        
+        # 将句子和其后的标点合并
+        merged_sentences = []
+        temp_sentence = ""
         for item in sentences:
-            if item in '？！。.~…\n，,':
-                temp += item
-                merged.append(temp)
-                temp = ""
+            if item in '？！。.~…\n':
+                temp_sentence += item
+                merged_sentences.append(temp_sentence)
+                temp_sentence = ""
             else:
-                temp += item
-        if temp: merged.append(temp)
-        return merged
+                temp_sentence += item
+        if temp_sentence: # 处理末尾没有标点的情况
+            merged_sentences.append(temp_sentence)
+        return merged_sentences
 
     def _filter_sensitive(self, text):
         for word in self.sensitive_words:
@@ -91,6 +96,7 @@ class TTSClientGenerator:
         self.pending_requests.add(request_id) # 【核心恢复】开始跟踪这个新任务
 
         chunks = []
+        # 条件性分割的逻辑保持不变
         if len(filtered_text) > 100:
             chunks = self._split_text(filtered_text)
         else:
@@ -114,7 +120,7 @@ class TTSClientGenerator:
             if not clean_chunk:
                 # 如果块为空，需要特殊处理以避免死锁
                 self.reassembly_buffer[request_id]['total'] -= 1
-                if self.reassembly_buffer[request_id]['total'] == 0:
+                if self.reassembly_buffer[request_id]['total'] <= 0: # 小于等于0以防万一
                     self.reassembly_buffer.pop(request_id, None)
                     self.pending_requests.discard(request_id)
                 continue
