@@ -1,10 +1,8 @@
-# tts_client.py (V9.1 - 优化分割逻辑)
-# 核心架构：完整复刻原 tts_text.py 的所有功能逻辑，包括任务跟踪、文本预处理、
-# 音频块重组等，仅将本地语音合成替换为对服务器的网络请求。
-# 本次更新：按照您的要求，修改了文本分割逻辑，现在只按整句分割，不再被逗号打断。
+# tts_client.py (V9.2 - 真正流式、无拼接播放最终版)
+# 核心架构：客户端分割文本，向服务器发送块请求。接收到音频块后，不拼接，
+# 直接将带有完整序列号的音频块放入优先队列，实现按顺序的流式播放。
 import collections, random, re, time, os, shutil, threading, queue, json, struct, socket, sys, base64
 import subprocess
-from pydub import AudioSegment
 
 class TTSClientGenerator:
     def __init__(self, server_host, server_port, output_dir, now_playing_callback=None, **kwargs):
@@ -23,14 +21,12 @@ class TTSClientGenerator:
         self.sensitive_words = kwargs.get('sensitive_words', [])
         self.now_playing_callback = now_playing_callback
         
-        # 【核心恢复】任务跟踪与重组机制
+        # 播放队列，现在直接存放音频块
         self.play_queue = queue.PriorityQueue()
-        self.reassembly_buffer = {} # 音频块重组缓冲区
-        self.pending_requests = set() # 跟踪所有已发送但未完成的请求ID
-        
         self._stop_event = threading.Event()
         self.current_playback_process = None
         self.request_id_counter = 0
+        self.pending_chunk_count = 0 # 跟踪正在网络中或服务器上处理的块数量
 
         self.log(f"流式TTS客户端初始化，准备连接服务器 {self.server_host}:{self.server_port}")
         self._connect_to_server()
@@ -48,22 +44,18 @@ class TTSClientGenerator:
         return self.request_id_counter
 
     def _split_text(self, text):
-        # 【核心改动】修改正则表达式，不再按逗号分割，只按结束标点和换行符分割
         sentences = [s.strip() for s in re.split(r'([？！。.~…\n])', text) if s.strip()]
-        
-        # 将句子和其后的标点合并
-        merged_sentences = []
-        temp_sentence = ""
+        merged = []
+        temp = ""
         for item in sentences:
             if item in '？！。.~…\n':
-                temp_sentence += item
-                merged_sentences.append(temp_sentence)
-                temp_sentence = ""
+                temp += item
+                merged.append(temp)
+                temp = ""
             else:
-                temp_sentence += item
-        if temp_sentence: # 处理末尾没有标点的情况
-            merged_sentences.append(temp_sentence)
-        return merged_sentences
+                temp += item
+        if temp: merged.append(temp)
+        return merged
 
     def _filter_sensitive(self, text):
         for word in self.sensitive_words:
@@ -74,57 +66,41 @@ class TTSClientGenerator:
         with self.lock:
             if not self.sock and not self._connect_to_server():
                 self.log(f"音频块请求发送失败，无法连接服务器。")
-                # 如果发送失败，需要从待处理集合中移除
-                self.pending_requests.discard(payload['request_id'])
+                self.pending_chunk_count = max(0, self.pending_chunk_count - 1)
                 return
             try:
                 request_data = json.dumps(payload).encode('utf-8')
                 self._send_msg(request_data)
             except Exception as e:
                 self.log(f"发送音频块请求时出错: {e}")
-                self.pending_requests.discard(payload['request_id'])
+                self.pending_chunk_count = max(0, self.pending_chunk_count - 1)
                 self.sock = None
 
     def add_task(self, text, priority=2, request_type='default'):
-        """【核心重构】完整复刻 tts_text.py 的文本预处理和任务分发逻辑"""
         if text in self.sounds_library:
             self._queue_local_sound(text, priority)
             return
 
         filtered_text = self._filter_sensitive(text)
         request_id = self._get_next_request_id()
-        self.pending_requests.add(request_id) # 【核心恢复】开始跟踪这个新任务
-
         chunks = []
-        # 条件性分割的逻辑保持不变
+        
         if len(filtered_text) > 100:
             chunks = self._split_text(filtered_text)
         else:
             chunks = [filtered_text]
 
-        if not chunks: 
-            self.pending_requests.discard(request_id)
-            return
+        if not chunks: return
             
         total_chunks = len(chunks)
         self.log(f"新任务 ReqID:{request_id} (Prio:{priority}) 被分割成 {total_chunks} 块，开始发送请求...")
 
-        # 初始化重组缓冲区
-        self.reassembly_buffer[request_id] = {
-            "chunks": {}, "total": total_chunks, "priority": priority, "full_text_map": {}
-        }
-
         for i, chunk_text in enumerate(chunks):
             chunk_id = i + 1
             clean_chunk = chunk_text.replace(" ", "").replace("\n", "")
-            if not clean_chunk:
-                # 如果块为空，需要特殊处理以避免死锁
-                self.reassembly_buffer[request_id]['total'] -= 1
-                if self.reassembly_buffer[request_id]['total'] <= 0: # 小于等于0以防万一
-                    self.reassembly_buffer.pop(request_id, None)
-                    self.pending_requests.discard(request_id)
-                continue
+            if not clean_chunk: continue
 
+            self.pending_chunk_count += 1 # 每发送一个请求，计数器加一
             triggered_keyword = next((kw for kw in self.keyword_responses if kw in clean_chunk), None)
             
             payload = {
@@ -139,11 +115,9 @@ class TTSClientGenerator:
         self.add_task(text, priority=0)
 
     def get_unprocessed_size(self):
-        """【核心恢复】准确计算正在处理和等待播放的任务总数"""
-        return self.play_queue.qsize() + len(self.pending_requests)
+        return self.play_queue.qsize() + self.pending_chunk_count
 
     def can_generate_new_script(self):
-        """【核心恢复】准确判断是否可以生成新话术"""
         return self.get_unprocessed_size() < 5
 
     def test_and_play_sync(self, text, use_assistant=False):
@@ -153,7 +127,7 @@ class TTSClientGenerator:
         self.add_task(text, priority=-1, request_type=request_type)
 
     def network_listener_worker(self):
-        """持续监听并接收服务器返回的音频块"""
+        """持续监听并接收服务器返回的音频块，直接放入播放队列"""
         while not self._stop_event.is_set():
             if not self.sock:
                 time.sleep(1)
@@ -167,23 +141,23 @@ class TTSClientGenerator:
                 
                 packet = json.loads(response_data.decode('utf-8'))
                 
-                req_id = packet.get('request_id')
-                if not req_id or req_id not in self.reassembly_buffer:
-                    continue # 忽略无效或过时的数据包
+                self.pending_chunk_count = max(0, self.pending_chunk_count - 1) # 收到响应，计数器减一
 
                 if packet.get("status") == "error":
-                    self.log(f"收到服务器错误包: ReqID {req_id}, Chunk {packet.get('chunk_id')}")
-                    # 即使块失败，也要计入，以防死锁
-                    self.reassembly_buffer[req_id]["chunks"][packet['chunk_id']] = None 
-                else:
-                    audio_data = base64.b64decode(packet['audio_data'])
-                    self.reassembly_buffer[req_id]["chunks"][packet['chunk_id']] = (audio_data, packet['text'])
+                    self.log(f"收到服务器错误包: ReqID {packet.get('request_id')}, Chunk {packet.get('chunk_id')}")
+                    continue
+
+                audio_data = base64.b64decode(packet['audio_data'])
+                req_id = packet['request_id']
+                chunk_id = packet['chunk_id']
                 
-                buffer_entry = self.reassembly_buffer[req_id]
-                # 检查是否已收齐所有块（包括失败的）
-                if len(buffer_entry["chunks"]) >= buffer_entry["total"]:
-                    self.log(f"ReqID {req_id} 的所有 {buffer_entry['total']} 个音频块已收齐，准备拼接。")
-                    self._assemble_and_queue_audio(req_id)
+                temp_audio_path = os.path.join(self.output_dir, f"audio_{req_id}_{chunk_id}.wav")
+                with open(temp_audio_path, 'wb') as f:
+                    f.write(audio_data)
+                
+                # 【核心改动】将单个音频块直接放入播放队列，用 (priority, request_id, chunk_id) 来排序
+                self.play_queue.put((packet['priority'], req_id, chunk_id, temp_audio_path, packet['text']))
+                self.log(f"✅ 已接收并入队音频块 {chunk_id}/{packet['total_chunks']} (ReqID: {req_id})")
 
             except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
                 self.log("与服务器连接中断，将尝试重连...")
@@ -191,52 +165,26 @@ class TTSClientGenerator:
             except Exception as e:
                 self.log(f"网络监听线程出错: {e}")
 
-    def _assemble_and_queue_audio(self, req_id):
-        """拼接指定ID的音频块并放入播放队列"""
-        buffer_entry = self.reassembly_buffer.pop(req_id, None)
-        if not buffer_entry: return
-        
-        try:
-            combined_audio = AudioSegment.empty()
-            full_text_parts = []
-            
-            for i in range(1, buffer_entry['total'] + 1):
-                chunk_data = buffer_entry['chunks'].get(i)
-                if chunk_data: # 跳过失败的块
-                    audio_data, text_part = chunk_data
-                    temp_chunk_path = os.path.join(self.output_dir, f"chunk_{req_id}_{i}.wav")
-                    with open(temp_chunk_path, 'wb') as f:
-                        f.write(audio_data)
-                    
-                    segment = AudioSegment.from_file(temp_chunk_path)
-                    combined_audio += segment
-                    full_text_parts.append(text_part)
-                    os.remove(temp_chunk_path)
-
-            if len(combined_audio) > 0:
-                final_path = os.path.join(self.output_dir, f"final_audio_{req_id}.wav")
-                combined_audio.export(final_path, format="wav")
-                
-                full_text = "".join(full_text_parts)
-                self.play_queue.put((buffer_entry["priority"], req_id, final_path, full_text))
-                self.log(f"✅ ReqID {req_id} 音频拼接完成并放入播放队列。")
-
-        except Exception as e:
-            self.log(f"❌ 拼接 ReqID {req_id} 音频时失败: {e}")
-        finally:
-            # 【核心恢复】无论成功与否，都要结束对这个任务的跟踪
-            self.pending_requests.discard(req_id)
-
-
     def play_audio_worker(self):
+        """按顺序播放队列中的音频块"""
+        current_req_id = -1
+        full_text_for_ui = ""
+        
         while not self._stop_event.is_set():
             try:
-                priority, seq, audio_path, content = self.play_queue.get(timeout=1)
+                # 队列现在是 (priority, request_id, chunk_id, audio_path, content)
+                priority, req_id, chunk_id, audio_path, content = self.play_queue.get(timeout=1)
                 
-                if self.now_playing_callback:
-                    self.now_playing_callback(content)
+                # UI同步逻辑：如果是新的一句话，先更新UI；如果是同一句话的后续部分，则不更新
+                if req_id != current_req_id:
+                    current_req_id = req_id
+                    # 查找这句话的所有文本并拼接，用于UI显示
+                    # 这是一个近似逻辑，因为队列中可能没有所有块
+                    # 但在播放第一块时，可以先显示第一块的文本
+                    if self.now_playing_callback:
+                        self.now_playing_callback(content)
                 
-                self.log(f"正在播放任务 Seq/ReqID:{seq} (Prio:{priority}): '{content[:50]}...'")
+                self.log(f"正在播放块 ReqID:{req_id}-{chunk_id} (Prio:{priority}): '{content}'")
                 self._play_audio_in_subprocess(audio_path)
                 
                 if os.path.exists(audio_path) and not audio_path.startswith(self.sounds_path):
@@ -245,6 +193,9 @@ class TTSClientGenerator:
                 
                 self.play_queue.task_done()
             except queue.Empty:
+                current_req_id = -1 # 队列为空，重置当前句子ID
+                if self.now_playing_callback:
+                    self.now_playing_callback("") # 清空UI显示
                 continue
             except Exception as e:
                 self.log(f"❌ 音频播放工作线程出错: {e}")
@@ -258,7 +209,7 @@ class TTSClientGenerator:
         audio_path = os.path.join(self.sounds_path, filename)
         if os.path.exists(audio_path):
             req_id = self._get_next_request_id()
-            self.play_queue.put((priority, req_id, audio_path, command))
+            self.play_queue.put((priority, req_id, 1, audio_path, command))
             self.log(f"✅ 本地音效已入队: {command}")
         else:
             self.log(f"❌ 本地音效文件未找到: {audio_path}")
