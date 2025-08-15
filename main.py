@@ -1,85 +1,210 @@
-import random
+# tts_server.py (V5.0 - 流式处理版)
+# 核心架构变更：服务器不再拼接音频，而是将长文本分割后，异步生成音频块，并立即流式返回给客户端。
+import socket
+import threading
+import json
+import logging
+import os
+import struct
 import time
+import random
+import re
 import requests
+import base64 # 用于音频数据的编码
+from gradio_client import Client, handle_file
+from concurrent.futures import ThreadPoolExecutor # 引入线程池
 
-model1 = """欢迎第一次来到直播间的宝贝，有没有第一次来到主播直播间？
-不知道直播间是一个什么样的直播间的宝贝
-那么主播给你介绍一下，今天主播的话是作为一个破价福利直播间，
-（产品名称）原价是卖到（产品名称+规格），
-那么今天主播直播间给你们做一波福利，现在来到主播直播间的宝贝
-原价（产品名称+价格），现在到手的话只需要（直播间价格）米就可以带回家了。一单就可以节约（优惠的钱）米。
-这款（产品名称）的话在某猫官方旗舰店也是常年占据去（产品的领域：例如护肤等）领域销量榜首的，一年的话也是能卖到几百万单
-所以说，宝贝不好用的产品的话，会有那么多个人去买嘛，不会的
-而且今天主播直播间的话不仅给你做到优惠（优惠的价格）米的价格，拍了的宝贝可以回来打已拍，打了已拍的宝贝，主播的话给你备注一下，安排快马加鞭发货，所以说没拍没买的宝贝抓紧时间了，领取一下优惠券。抓经时间去拍，而且今天拍的宝子还送（赠品名称：如果没有就不说这句）"""
+# --- 服务器端配置 ---
+GRADIO_URL = "http://localhost:9872/"
+REF_AUDIO_PATH = "领红包左上角抢红包啦，领完红包，抢完红包，再去拍，再去卖，再去拍啊，正品保证正品保真啦。.wav"
+# ... 其他配置保持不变 ...
+ASSISTANT_TTS_URL = "http://localhost:9880/"
+ASSISTANT_SPEAKER = "助播2.pt"
+DASHSCOPE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
+SERVER_HOST = '0.0.0.0'
+SERVER_PORT = 12345
+OUTPUT_DIR = "server_temp_audio"
+LONG_TEXT_THRESHOLD = 100
 
-model2 = """今天拍下来的宝贝，大概今天就可以发货啦
-有没有正在拍1号链接的宝贝， 你是不是在犹豫，纠结呢？  主播给各位宝贝说下，因为主播直播间真的很实惠，有没有买过的宝贝，咱们之前买一只是多少钱，是不是（官方旗舰店的价格）米，但是今天主播直播间只要（直播间的价格）米 ，有没有宝贝是不是担心这么一个优惠的价格，是不是正品，主播给宝贝们说一下，宝贝们可以看下付款页面，咱们这边是不是官方旗舰店的。宝贝，也不用担心日期的问题，都是新鲜日期。
-所以说没拍没买的宝贝一定要抓紧时间了 咱家所剩下的库存不多了  一定要抓紧时间了 拍一单少一单优惠券所剩时间不多了 ，抓紧时间下单了 ，马上也要恢复原价了今天错过就没有啦
-这是主播给你们的补贴才能得到的优惠哈。今天错过啦这样的优惠哈，我们在想拍，在想买的话是真的找不到的哈。所以没拍没买的姐妹抓紧时间啦，错过啦话，我们在想以这样的价格，这样的条件买到这样的产品是真的找不到啦（售后服务）"""
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
 
-model3 = """如果可以的话，各位宝贝可以给主播点个小关小注，
-因为主播直播间的产品的话还是比较实惠的，以后你们有想要任何产品的话；可以给主播点完关注过后
-，过后我们可以先到主播直播间，来，先来对比一下价格，因为今天在主播直播间的话
-我们拍一单（产品名称）的话就可以节省（节约的钱）米，拍两单（产品名称）的话可以节省（优惠的价格*2），拍三单的话可以立省（优惠的价格*3），我们谁的钱的话，也都不是大风刮来的。都是自己辛辛苦苦挣来的。
-所以说能节省一点是一点，产品质量又是一样的。所以说喜欢主播的话，可以给主播点个小关小注，以后有想要产品的话都可以到主播直播间来看一下哈，很感谢宝贝的关注哦。
-如果说你在主播直播间，没有找到你想要的产品的话，你也可以把你想的产品直接打在公屏上，主播看到过后都会尽可能的去给各位姐妹找找看哦"""
+class StreamingTTSServer:
+    def __init__(self):
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        self.main_tts_client = None
+        self.request_id_counter = 0
+        self.request_lock = threading.Lock()
 
-model = [model1, model2, model3]
+        # 【核心改动】引入高、低优先级两个线程池
+        self.executor_high = ThreadPoolExecutor(max_workers=5, thread_name_prefix='HighPrio')
+        self.executor_low = ThreadPoolExecutor(max_workers=5, thread_name_prefix='LowPrio')
 
-class DeepSeekClient:
-    def __init__(self, api_url, api_key):
-        self.api_url = api_url
-        self.api_key = api_key
-        self.model = model
-        self.messages = [
-            {"role": "system", "content": "你是个直播话术组手，我给你产品信息，并且给你话术模板，根据我给的信息，来适当更改。（）里面的内容，直接换，把元换成米。只回答话术，不回答别的。每次生成的话术，都不要一样，尽可能的改变一点"}
-        ]
+        try:
+            self.main_tts_client = Client(GRADIO_URL)
+            logging.info("✅ 主TTS服务连接成功。")
+        except Exception as e:
+            logging.error(f"❌ 无法连接主TTS服务: {e}")
 
-    def fetch_text(self, product_description):
-        print("🎤 调用 DeepSeek API 生成文本中...")
-        max_attempts = 5
-        attempt = 0
-        while attempt < max_attempts:
-            try:
-                # 添加随机话术模板
-                self.messages.append({"role": "user", "content": f"话术模板{random.choice(self.model)}"})
-                # 添加产品描述
-                self.messages.append({"role": "user", "content": f"请根据以下产品信息:\n{product_description}"})
-                response = requests.post(
-                    f"{self.api_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                    json={
-                        "model": "deepseek-chat",
-                        "messages": self.messages,
-                        "stream": False,
-                        "temperature": 1.8,
-                        "top_p": 0.7
-                    }
-                )
-                response.raise_for_status()
-                result = response.json()
-                speech = result["choices"][0]["message"]["content"]
-                self.messages.append({"role": "assistant", "content": speech})
-                print(f"✅ DeepSeek 生成内容: {speech}")
-                return speech
-            except requests.HTTPError as e:
-                if response.status_code == 400:
-                    attempt += 1
-                    wait_time = 10 * attempt
-                    print(f"❌ 请求返回 400，重试 {attempt}/{max_attempts}，等待 {wait_time} 秒...")
-                    time.sleep(wait_time)
-                    # 当消息列表超过 20 条时，重置对话历史，防止消息累积
-                    if len(self.messages) > 20:
-                        print("🔄 消息累计过多，重置对话历史")
-                        self.messages = [{
-                            "role": "system",
-                            "content": "你是个直播话术组手，我给你产品信息，并且给你话术模板，根据我给的信息，来适当更改。（）里面的内容，直接换，把元换成米。只回答话术，不回答别的。每次生成的话术，都不要一样，尽可能的改变一点"
-                        }]
-                else:
-                    print(f"❌ DeepSeek 生成失败: {e}")
-                    return ""
-            except Exception as e:
-                print(f"❌ DeepSeek 生成失败: {e}")
-                return ""
-        print("❌ 达到最大重试次数，生成失败")
-        return ""
+    def get_next_request_id(self):
+        with self.request_lock:
+            self.request_id_counter += 1
+            return self.request_id_counter
+
+    def _split_sentences(self, text):
+        # ... 分割逻辑不变 ...
+        sentences = [s.strip() for s in re.split(r'([？！。.~…\n，,])', text) if s.strip()]
+        merged = []
+        temp = ""
+        for item in sentences:
+            if item in '？！。.~…\n，,':
+                temp += item
+                merged.append(temp)
+                temp = ""
+            else:
+                temp += item
+        if temp: merged.append(temp)
+        return merged
+
+    def _generate_and_send_chunk(self, client_socket, text_chunk, priority, request_id, chunk_id, total_chunks, is_assistant=False):
+        """生成单个音频块并立即发送的核心函数"""
+        try:
+            audio_path = self.generate_assistant_audio(text_chunk) if is_assistant else self.generate_main_audio(text_chunk)
+            
+            if audio_path and os.path.exists(audio_path):
+                with open(audio_path, 'rb') as f:
+                    audio_data = f.read()
+                
+                # 使用Base64编码音频数据，确保JSON传输安全
+                encoded_audio = base64.b64encode(audio_data).decode('utf-8')
+                
+                response_packet = {
+                    "status": "success",
+                    "request_id": request_id,
+                    "chunk_id": chunk_id,
+                    "total_chunks": total_chunks,
+                    "priority": priority,
+                    "text": text_chunk,
+                    "audio_data": encoded_audio
+                }
+                self._send_msg(client_socket, json.dumps(response_packet).encode('utf-8'))
+                logging.info(f"✅ 已发送音频块 {chunk_id}/{total_chunks} (ReqID: {request_id})")
+                os.remove(audio_path)
+            else:
+                raise ValueError("音频文件生成失败或未找到")
+        except Exception as e:
+            logging.error(f"处理音频块 {chunk_id}/{total_chunks} (ReqID: {request_id}) 失败: {e}")
+            # 发送一个失败的包，让客户端知道
+            error_packet = {"status": "error", "request_id": request_id, "chunk_id": chunk_id, "message": str(e)}
+            self._send_msg(client_socket, json.dumps(error_packet).encode('utf-8'))
+
+    def handle_client(self, client_socket, addr):
+        logging.info(f"接受来自 {addr} 的新连接。")
+        try:
+            while True:
+                data = self._recv_msg(client_socket)
+                if data is None: break
+
+                message = json.loads(data.decode('utf-8'))
+                text = message.get('text')
+                priority = message.get('priority', 2) # 从客户端接收优先级
+
+                request_id = self.get_next_request_id()
+                logging.info(f"收到新任务 ReqID:{request_id}, Prio:{priority}, Text:'{text[:30]}...'")
+
+                # 1. 分割文本
+                text_chunks = self._split_sentences(text)
+                if not text_chunks: continue
+                total_chunks = len(text_chunks)
+
+                # 2. 选择执行器并提交任务
+                executor = self.executor_high if priority < 2 else self.executor_low
+                
+                for i, chunk in enumerate(text_chunks):
+                    chunk_id = i + 1
+                    executor.submit(
+                        self._generate_and_send_chunk,
+                        client_socket,
+                        chunk,
+                        priority,
+                        request_id,
+                        chunk_id,
+                        total_chunks,
+                        is_assistant=False # 简化：此示例中所有请求都为主播声音
+                    )
+        except (ConnectionResetError, json.JSONDecodeError):
+            logging.warning(f"客户端 {addr} 连接异常或断开。")
+        finally:
+            client_socket.close()
+
+    # ... generate_main_audio 和 generate_assistant_audio 函数保持不变 ...
+    def generate_main_audio(self, text):
+        if not self.main_tts_client: return None
+        audio_path = None
+        try:
+            speed = round(random.uniform(0.9, 1.1), 2)
+            audio_path = self.main_tts_client.predict(
+                ref_wav_path=handle_file(REF_AUDIO_PATH), prompt_text="领红包左上角抢红包啦，领完红包，抢完红包，再去拍，再去卖，再去拍啊，正品保证正品保真啦。", text=text,
+                prompt_language="中文", text_language="中文", how_to_cut="凑四句一切",
+                top_k=15, top_p=1, temperature=1, ref_free=False, speed=speed, api_name="/get_tts_wav"
+            )
+            return audio_path
+        except Exception as e:
+            logging.error(f"主TTS生成失败: {e}")
+            if audio_path and os.path.exists(audio_path): os.remove(audio_path)
+            return None
+
+    def generate_assistant_audio(self, text):
+        params = {"text": text, "speaker": ASSISTANT_SPEAKER, "volume": 1.3, "speed": 1.1}
+        temp_path = os.path.join(OUTPUT_DIR, f"assist_{int(time.time())}.wav")
+        try:
+            url_to_request = ASSISTANT_TTS_URL.strip('/')
+            response = requests.get(url_to_request, params=params, stream=True, timeout=10)
+            response.raise_for_status()
+            with open(temp_path, 'wb') as f: f.write(response.content)
+            return temp_path
+        except Exception as e:
+            logging.error(f"助播TTS生成失败：{e}")
+            if os.path.exists(temp_path): os.remove(temp_path)
+            return None
+
+    # ... start() 和网络辅助函数保持不变 ...
+    def start(self):
+        if not self.main_tts_client:
+            logging.critical("❌ 主TTS服务初始化失败，服务器无法启动。")
+            return
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind((SERVER_HOST, SERVER_PORT))
+        server_socket.listen(5)
+        logging.info(f"🚀 流式服务器已启动，正在监听 {SERVER_HOST}:{SERVER_PORT}...")
+        try:
+            while True:
+                client, addr = server_socket.accept()
+                threading.Thread(target=self.handle_client, args=(client, addr), daemon=True).start()
+        except KeyboardInterrupt:
+            logging.info("服务器正在关闭...")
+        finally:
+            server_socket.close()
+
+    def _send_msg(self, sock, data):
+        try:
+            length = struct.pack('>I', len(data))
+            sock.sendall(length + data)
+        except (ConnectionResetError, BrokenPipeError):
+            logging.warning("尝试向已关闭的客户端发送消息。")
+    def _recv_msg(self, sock):
+        raw_msglen = self._recv_all(sock, 4)
+        if not raw_msglen: return None
+        msglen = struct.unpack('>I', raw_msglen)[0]
+        return self._recv_all(sock, msglen)
+    def _recv_all(self, sock, n):
+        data = bytearray()
+        while len(data) < n:
+            packet = sock.recv(n - len(data))
+            if not packet: return None
+            data.extend(packet)
+        return data
+
+if __name__ == "__main__":
+    server = StreamingTTSServer()
+    server.start()
