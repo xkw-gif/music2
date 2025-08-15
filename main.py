@@ -1,6 +1,6 @@
-# tts_client.py (V5.2 - 全功能修复版)
+# tts_client.py (V5.3 - 关键词与测试逻辑最终修复版)
 # 核心架构变更：客户端现在接收音频块数据包，并在本地进行重组和拼接，再放入播放队列。
-# 本次更新：恢复了 interrupt_and_speak, get_unprocessed_size, can_generate_new_script, test_and_play_sync 及本地音效功能。
+# 本次更新：彻底修复了常规流程中关键词检测与助播触发的逻辑，并优化了所有功能的网络请求方式。
 import collections, random, re, time, os, shutil, threading, queue, json, struct, socket, sys, base64
 import subprocess
 from pydub import AudioSegment
@@ -14,10 +14,12 @@ class TTSClientGenerator:
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         
-        # 【修复】重新加入本地音效模块
         self.sounds_path = "sounds"
         self.sounds_library = {"[咳嗽]": "咳嗽声.WAV", "[叹气]": "叹气声.WAV", "[吞咽]": "吞咽声.WAV",
                                "[呼吸]": ["呼吸1.WAV", "呼吸2.WAV", "呼吸3.WAV"]}
+        
+        # 【修复】重新加入关键词检测所需的数据
+        self.keyword_responses = kwargs.get('keyword_responses', {})
         
         self.reassembly_buffer = {} #格式: {req_id: {"chunks": {}, "total": N, "received_time": T}}
         self.play_queue = queue.PriorityQueue()
@@ -35,79 +37,73 @@ class TTSClientGenerator:
     def log(self, message):
         print(f"[TTSClient] {message}")
 
-    def add_task(self, text, priority=2):
-        """主程序调用的唯一入口：发送任务请求到服务器"""
-        # 【修复】增加本地音效处理逻辑
-        if text in self.sounds_library:
-            self._queue_local_sound(text, priority)
-            return
-            
+    def _send_request_to_server(self, payload):
+        """【优化】所有网络请求的统一发送入口"""
         with self.lock:
             if not self.sock:
                 if not self._connect_to_server():
-                    self.log(f"任务发送失败，无法连接服务器: '{text[:30]}...'")
+                    self.log(f"网络请求发送失败，无法连接服务器。")
                     return
             try:
-                request_packet = {
-                    "text": text,
-                    "priority": priority,
-                    "request_type": "default" # 明确告知是常规任务
-                }
-                self._send_msg(json.dumps(request_packet).encode('utf-8'))
-                self.log(f"已发送任务 (Prio:{priority}): '{text[:30]}...'")
+                # 确保所有请求都包含所有必需的键
+                payload.setdefault('text', '')
+                payload.setdefault('priority', 2)
+                payload.setdefault('request_type', 'default')
+                payload.setdefault('triggered_keyword', None)
+
+                request_data = json.dumps(payload).encode('utf-8')
+                self._send_msg(request_data)
+                self.log(f"已发送请求 (类型:{payload['request_type']}, Prio:{payload['priority']}): '{payload['text'][:30]}...'")
             except Exception as e:
-                self.log(f"发送任务时出错: {e}")
+                self.log(f"发送网络请求时出错: {e}")
                 self.sock = None
 
-    # 【修复】重新加入 interrupt_and_speak 函数
+    def add_task(self, text, priority=2):
+        """主程序调用的唯一入口：发送常规任务请求到服务器"""
+        if text in self.sounds_library:
+            self._queue_local_sound(text, priority)
+            return
+        
+        # 【修复】在客户端进行关键词检测
+        triggered_keyword = next((kw for kw in self.keyword_responses if kw in text), None)
+        
+        payload = {
+            "text": text,
+            "priority": priority,
+            "request_type": "default",
+            "triggered_keyword": triggered_keyword # 将检测到的关键词(或None)发给服务器
+        }
+        self._send_request_to_server(payload)
+
     def interrupt_and_speak(self, text):
         """紧急插话功能。通过发送一个最高优先级的任务来实现插队。"""
         self.log(f"⚡ 收到紧急插话指令: {text}")
-        # 使用优先级 0 来确保服务器优先处理
         self.add_task(text, priority=0)
 
-    # 【修复】重新加入 get_unprocessed_size 函数
     def get_unprocessed_size(self):
         """返回正在重组和等待播放的任务总数，用于判断是否繁忙"""
         return self.play_queue.qsize() + len(self.reassembly_buffer)
 
-    # 【修复】重新加入 can_generate_new_script 函数
     def can_generate_new_script(self):
         """判断是否可以生成新话术的客户端近似逻辑"""
-        # 如果等待处理（重组+播放）的任务少于5个，就认为可以生成
         return self.get_unprocessed_size() < 5
 
-    # 【修复】重新加入 test_and_play_sync 函数
     def test_and_play_sync(self, text, use_assistant=False):
         """发送一个专门的测试请求到服务器"""
         self.log(f"【声音测试】{'助播' if use_assistant else '主线'}: {text}")
         if not text: return
         
         request_type = 'test_assistant' if use_assistant else 'test_main'
-        # 使用最高优先级(-1)发送测试请求
-        self.generate_audio_via_network(text, -1, request_type=request_type)
+        
+        payload = {
+            "text": text,
+            "priority": -1, # 使用最高优先级
+            "request_type": request_type
+        }
+        self._send_request_to_server(payload)
         self.log("【声音测试】请求已发送到服务器，请等待播放...")
 
-    def generate_audio_via_network(self, text, priority, request_type='default'):
-        # 这个函数现在是内部调用，负责实际的网络发送
-        with self.lock:
-            if not self.sock and not self._connect_to_server():
-                self.log(f"网络请求发送失败，无法连接服务器。")
-                return
-            try:
-                request_data = json.dumps({
-                    'text': text,
-                    'request_type': request_type,
-                    'priority': priority
-                }).encode('utf-8')
-                self._send_msg(request_data)
-            except Exception as e:
-                self.log(f"发送网络请求时出错: {e}")
-                self.sock = None
-
-
     def network_listener_worker(self):
-        # ... 此函数逻辑与上一版相同 ...
         while not self._stop_event.is_set():
             if not self.sock:
                 time.sleep(2)
@@ -141,7 +137,6 @@ class TTSClientGenerator:
                 self.log(f"网络监听线程出错: {e}")
 
     def _assemble_and_queue_audio(self, req_id):
-        # ... 此函数逻辑与上一版相同 ...
         buffer_entry = self.reassembly_buffer.pop(req_id)
         try:
             combined_audio = AudioSegment.empty()
@@ -168,7 +163,6 @@ class TTSClientGenerator:
                 priority, req_id, audio_path, content = self.play_queue.get(timeout=1)
                 self.log(f"正在播放任务 ReqID:{req_id} (Prio:{priority}): '{content[:50]}...'")
                 self._play_audio_in_subprocess(audio_path)
-                # 【修复】本地音效文件不应被删除
                 if os.path.exists(audio_path) and not audio_path.startswith(self.sounds_path):
                     try: os.remove(audio_path)
                     except OSError: pass
@@ -178,21 +172,19 @@ class TTSClientGenerator:
             except Exception as e:
                 self.log(f"❌ 音频播放工作线程出错: {e}")
 
-    # 【新增】处理本地音效的函数
     def _queue_local_sound(self, command, priority):
         sound_info = self.sounds_library.get(command)
         if not sound_info: return
         filename = random.choice(sound_info) if isinstance(sound_info, list) else sound_info
         audio_path = os.path.join(self.sounds_path, filename)
         if os.path.exists(audio_path):
-            local_req_id = -int(time.time()) # 使用负数时间戳作为唯一ID
+            local_req_id = -int(time.time())
             self.play_queue.put((priority, local_req_id, audio_path, command))
             self.log(f"✅ 本地音效已入队: {command}")
         else:
             self.log(f"❌ 本地音效文件未找到: {audio_path}")
 
     def stop(self):
-        # ... 此函数逻辑与上一版相同 ...
         self._stop_event.set()
         if self.current_playback_process and self.current_playback_process.poll() is None:
             self.current_playback_process.terminate()
@@ -202,7 +194,6 @@ class TTSClientGenerator:
                 self.sock = None
 
     def _play_audio_in_subprocess(self, audio_path):
-        # ... 此函数逻辑与上一版相同 ...
         if self.current_playback_process and self.current_playback_process.poll() is None:
             self.current_playback_process.terminate()
             try: self.current_playback_process.wait(timeout=0.5)
@@ -220,7 +211,6 @@ class TTSClientGenerator:
             self.log(f"❌ 启动播放子进程时出错: {e}")
 
     def _connect_to_server(self):
-        # ... 此函数逻辑与上一版相同 ...
         with self.lock:
             if self.sock: self.sock.close()
             try:
@@ -235,17 +225,14 @@ class TTSClientGenerator:
                 return False
 
     def _send_msg(self, data):
-        # ... 此函数逻辑与上一版相同 ...
         length = struct.pack('>I', len(data))
         self.sock.sendall(length + data)
     def _recv_msg(self):
-        # ... 此函数逻辑与上一版相同 ...
         raw_msglen = self._recv_all(4)
         if not raw_msglen: return None
         msglen = struct.unpack('>I', raw_msglen)[0]
         return self._recv_all(msglen)
     def _recv_all(self, n):
-        # ... 此函数逻辑与上一版相同 ...
         data = bytearray()
         while len(data) < n:
             packet = self.sock.recv(n - len(data))
